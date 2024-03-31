@@ -14,8 +14,8 @@
 #define GGML_SYCL_BACKEND_HPP
 
 #include "common.hpp"
-#include "vecdotq.hpp"
-#include "mmvq.hpp"
 #include "mmq.hpp"
+#include "mmvq.hpp"
+#include "vecdotq.hpp"
 
 #endif // GGML_SYCL_BACKEND_HPP
