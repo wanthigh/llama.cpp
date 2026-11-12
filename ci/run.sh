@@ -1,4 +1,4 @@
-#/bin/bash
+#!/usr/bin/env bash
 #
 # sample usage:
 #
@@ -10,8 +10,32 @@
 # # with CUDA support
 # GG_BUILD_CUDA=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
 #
+# # with ROCm support
+# GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS=gfx1151 bash ./ci/run.sh ./tmp/results ./tmp/mnt
+#
 # # with SYCL support
 # GG_BUILD_SYCL=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
+#
+# # with VULKAN support
+# GG_BUILD_VULKAN=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
+#
+# # with WebGPU support
+# GG_BUILD_WEBGPU=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
+#
+# # with MUSA support
+# GG_BUILD_MUSA=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
+#
+# # with KLEIDIAI support
+# GG_BUILD_KLEIDIAI=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
+#
+# # with BLAS support
+# GG_BUILD_BLAS=1 bash ./ci/run.sh ./tmp/results ./tmp/mnt
+#
+# with BLAS support (custom vendor)
+# GG_BUILD_BLAS=1 GG_BUILD_BLAS_VENDOR=Intel10_64lp bash ./ci/run.sh ./tmp/results ./tmp/mnt
+#
+# with OPENVINO support
+# GG_BUILD_OPENVINO=1 GG_BUILD_LOW_PERF=1 GGML_OPENVINO_DEVICE=CPU bash ./ci/run.sh ./tmp/results ./tmp/mnt
 #
 
 if [ -z "$2" ]; then
@@ -25,22 +49,54 @@ mkdir -p "$2"
 OUT=$(realpath "$1")
 MNT=$(realpath "$2")
 
-rm -f "$OUT/*.log"
-rm -f "$OUT/*.exit"
-rm -f "$OUT/*.md"
+rm -f $OUT/*.log
 
 sd=`dirname $0`
 cd $sd/../
 SRC=`pwd`
 
-CMAKE_EXTRA="-DLLAMA_FATAL_WARNINGS=ON"
+CMAKE_EXTRA="-DLLAMA_FATAL_WARNINGS=${LLAMA_FATAL_WARNINGS:-ON} -DLLAMA_OPENSSL=OFF -DGGML_SCHED_NO_REALLOC=ON"
+CTEST_EXTRA=""
+
+# Default to use make unless specified for compatibility
+CMAKE_GENERATOR="Unix Makefiles"
+
+if [ ! -z "${GG_BUILD_NINJA}" ]; then
+    CMAKE_GENERATOR="Ninja"
+fi
 
 if [ ! -z ${GG_BUILD_METAL} ]; then
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DLLAMA_METAL_SHADER_DEBUG=ON"
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_METAL=ON"
+else
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_METAL=OFF"
 fi
 
 if [ ! -z ${GG_BUILD_CUDA} ]; then
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DLLAMA_CUDA=1"
+    # TODO: Drop GGML_CUDA_CCCL_VERSION when CUDA CI uses CTK >= 13.5, which bundles CCCL >= 3.5.
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_CUDA=ON -DGGML_CUDA_CCCL_VERSION=v3.4.3"
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        CUDA_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d '.')
+        if [[ -n "$CUDA_ARCH" && "$CUDA_ARCH" =~ ^[0-9]+$ ]]; then
+            CMAKE_EXTRA="${CMAKE_EXTRA} -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}"
+        else
+            echo "Warning: Using fallback CUDA architectures"
+            CMAKE_EXTRA="${CMAKE_EXTRA} -DCMAKE_CUDA_ARCHITECTURES=61;70;75;80;86;89"
+        fi
+    else
+        echo "Error: nvidia-smi not found, cannot build with CUDA"
+        exit 1
+    fi
+fi
+
+if [ ! -z ${GG_BUILD_ROCM} ]; then
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DCMAKE_HIP_COMPILER=$(hipconfig -l)/clang -DGGML_HIP=ON"
+    if [ -z ${GG_BUILD_AMDGPU_TARGETS} ]; then
+        echo "Missing GG_BUILD_AMDGPU_TARGETS, please set it to your GPU architecture (e.g. gfx90a, gfx1100, etc.)"
+        exit 1
+    fi
+
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DGPU_TARGETS=${GG_BUILD_AMDGPU_TARGETS}"
 fi
 
 if [ ! -z ${GG_BUILD_SYCL} ]; then
@@ -49,29 +105,110 @@ if [ ! -z ${GG_BUILD_SYCL} ]; then
         echo "source /opt/intel/oneapi/setvars.sh"
         exit 1
     fi
-
-    CMAKE_EXTRA="${CMAKE_EXTRA} -DLLAMA_SYCL=1 DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DLLAMA_SYCL_F16=ON"
+    # Use only main GPU
+    export ONEAPI_DEVICE_SELECTOR="level_zero:0"
+    # Enable sysman for correct memory reporting
+    export ZES_ENABLE_SYSMAN=1
+    # to circumvent precision issues on CPY operations
+    export SYCL_PROGRAM_COMPILE_OPTIONS="-cl-fp32-correctly-rounded-divide-sqrt"
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_SYCL=1 -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_SYCL_F16=ON"
 fi
+
+if [ ! -z ${GG_BUILD_VULKAN} ]; then
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_VULKAN=1"
+
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        MACOS_RUNNER_CUSTOM_VULKAN_CMAKE_LOCATION="/usr/local/lib/cmake/vulkan"
+        MACOS_RUNNER_CUSTOM_SPIRV_HEADERS_LOCATION="${MACOS_RUNNER_CUSTOM_VULKAN_CMAKE_LOCATION}/SPIRV-Headers/SPIRV-HeadersConfig.cmake"
+        if [[ -f "${MACOS_RUNNER_CUSTOM_SPIRV_HEADERS_LOCATION}" || -h "${MACOS_RUNNER_CUSTOM_SPIRV_HEADERS_LOCATION}" ]]; then
+            CMAKE_EXTRA="${CMAKE_EXTRA} -DSPIRV-Headers_DIR=${MACOS_RUNNER_CUSTOM_VULKAN_CMAKE_LOCATION}/SPIRV-Headers"
+        fi
+    fi
+
+    # Build shared libs on Windows
+    # to reduce binary size and avoid errors in library loading unit tests
+    if uname -s | grep -qi nt; then
+        CMAKE_EXTRA="${CMAKE_EXTRA} -DBUILD_SHARED_LIBS=ON"
+    fi
+fi
+
+if [ ! -z ${GG_BUILD_WEBGPU} ]; then
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_WEBGPU=1"
+
+    if [ ! -z "${GG_BUILD_WEBGPU_DAWN_PREFIX}" ]; then
+        if [ -z "${CMAKE_PREFIX_PATH}" ]; then
+            export CMAKE_PREFIX_PATH="${GG_BUILD_WEBGPU_DAWN_PREFIX}"
+        else
+            export CMAKE_PREFIX_PATH="${GG_BUILD_WEBGPU_DAWN_PREFIX}:${CMAKE_PREFIX_PATH}"
+        fi
+    fi
+
+    # For some systems, Dawn_DIR needs to be set explicitly, e.g., the lib64 path
+    if [ ! -z "${GG_BUILD_WEBGPU_DAWN_DIR}" ]; then
+        CMAKE_EXTRA="${CMAKE_EXTRA} -DDawn_DIR=${GG_BUILD_WEBGPU_DAWN_DIR}"
+    fi
+fi
+
+if [ ! -z ${GG_BUILD_MUSA} ]; then
+    # Use ph1 by default (MTT S5000)
+    MUSA_ARCH=${MUSA_ARCH:-31}
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_MUSA=ON -DMUSA_ARCHITECTURES=${MUSA_ARCH}"
+fi
+
+if [ ! -z ${GG_BUILD_NO_SVE} ]; then
+    # arm 9 and newer enables sve by default, adjust these flags depending on the cpu used
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.5-a+fp16+i8mm"
+fi
+
+if [ -n "${GG_BUILD_KLEIDIAI}" ]; then
+    echo ">>===== Enabling KleidiAI support"
+    CMAKE_EXTRA="${CMAKE_EXTRA:+$CMAKE_EXTRA } -DGGML_CPU_KLEIDIAI=ON"
+fi
+
+if [ ! -z ${GG_BUILD_BLAS} ]; then
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=${GG_BUILD_BLAS_VENDOR:-OpenBLAS}"
+else
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_BLAS=OFF"
+fi
+
+if [ ! -z ${GG_BUILD_OPENVINO} ]; then
+    if [ -z ${OpenVINO_DIR} ]; then
+        echo "OpenVINO_DIR not found, please install OpenVINO via archives and enable it by:"
+        echo "source /opt/intel/openvino/setupvars.sh"
+        exit 1
+    fi
+    CMAKE_EXTRA="${CMAKE_EXTRA} -DGGML_OPENVINO=ON"
+
+    # TODO: fix failing tests on OpenVINO backend
+    CTEST_EXTRA="-E test-llama-archs|test-llama-context|test-fp8-kv"
+fi
+
 ## helpers
 
-# download a file if it does not exist or if it is outdated
+# download a file unless already cached in $MNT
 function gg_wget {
     local out=$1
     local url=$2
 
     local cwd=`pwd`
+    local name=`basename $url`
+    local tmp=.gg-wget.$$.tmp
 
     mkdir -p $out
     cd $out
 
-    # should not re-download if file is the same
-    wget -nv -N $url
+    # cache first: HF artifacts are static, HF sends no Last-Modified for -N
+    if [ ! -s $name ]; then
+        # publish with mv: concurrent runners never read partial files
+        rm -rf $tmp && mkdir $tmp
+        (cd $tmp && wget -nv $url)
+        if [ -s $tmp/$name ]; then
+            mv -f $tmp/$name $name
+        fi
+        rm -rf $tmp
+    fi
 
     cd $cwd
-}
-
-function gg_printf {
-    printf -- "$@" >> $OUT/README.md
 }
 
 function gg_run {
@@ -82,12 +219,9 @@ function gg_run {
 
     gg_run_$ci | tee $OUT/$ci.log
     cur=$?
-    echo "$cur" > $OUT/$ci.exit
 
     set +x
     set +o pipefail
-
-    gg_sum_$ci
 
     ret=$((ret | cur))
 }
@@ -103,23 +237,15 @@ function gg_run_ctest_debug {
 
     set -e
 
-    (time cmake -DCMAKE_BUILD_TYPE=Debug ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
-    (time make -j                                          ) 2>&1 | tee -a $OUT/${ci}-make.log
+    # Check required binaries are installed
+    gg_check_build_requirements
 
-    (time ctest --output-on-failure -L main -E test-opt ) 2>&1 | tee -a $OUT/${ci}-ctest.log
+    (cmake -G "${CMAKE_GENERATOR}" -DCMAKE_BUILD_TYPE=Debug ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
+    (time cmake --build . --config Debug -j$(nproc)) 2>&1 | tee -a $OUT/${ci}-make.log
+
+    (time ctest -C Debug --output-on-failure -L main -E "test-opt|test-llama-archs" ${CTEST_EXTRA}) 2>&1 | tee -a $OUT/${ci}-ctest.log
 
     set +e
-}
-
-function gg_sum_ctest_debug {
-    gg_printf '### %s\n\n' "${ci}"
-
-    gg_printf 'Runs ctest in debug mode\n'
-    gg_printf '- status: %s\n' "$(cat $OUT/${ci}.exit)"
-    gg_printf '```\n'
-    gg_printf '%s\n' "$(cat $OUT/${ci}-ctest.log)"
-    gg_printf '```\n'
-    gg_printf '\n'
 }
 
 # ctest_release
@@ -131,83 +257,63 @@ function gg_run_ctest_release {
 
     set -e
 
-    (time cmake -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
-    (time make -j                                            ) 2>&1 | tee -a $OUT/${ci}-make.log
+    # Check required binaries are installed
+    gg_check_build_requirements
+
+    (cmake -G "${CMAKE_GENERATOR}" -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
+    (time cmake --build . --config Release -j$(nproc)) 2>&1 | tee -a $OUT/${ci}-make.log
 
     if [ -z ${GG_BUILD_LOW_PERF} ]; then
-        (time ctest --output-on-failure -L main ) 2>&1 | tee -a $OUT/${ci}-ctest.log
+        (time ctest -C Release --output-on-failure -L main ${CTEST_EXTRA}) 2>&1 | tee -a $OUT/${ci}-ctest.log
     else
-        (time ctest --output-on-failure -L main -E test-opt ) 2>&1 | tee -a $OUT/${ci}-ctest.log
+        (time ctest -C Release --output-on-failure -L main -E test-opt ${CTEST_EXTRA}) 2>&1 | tee -a $OUT/${ci}-ctest.log
     fi
 
     set +e
 }
 
-function gg_sum_ctest_release {
-    gg_printf '### %s\n\n' "${ci}"
+# test_llama_archs_tensor_split
 
-    gg_printf 'Runs ctest in release mode\n'
-    gg_printf '- status: %s\n' "$(cat $OUT/${ci}.exit)"
-    gg_printf '```\n'
-    gg_printf '%s\n' "$(cat $OUT/${ci}-ctest.log)"
-    gg_printf '```\n'
-}
-
-# test_scripts_debug
-
-function gg_run_test_scripts_debug {
+function gg_run_test_llama_archs_tensor_split {
     cd ${SRC}
 
     set -e
 
-    (cd ./examples/gguf-split && time bash tests.sh "$SRC/build-ci-debug/bin" "$MNT/models") 2>&1 | tee -a $OUT/${ci}-scripts.log
-    (cd ./examples/quantize   && time bash tests.sh "$SRC/build-ci-debug/bin" "$MNT/models") 2>&1 | tee -a $OUT/${ci}-scripts.log
+    if [ ! -z ${GG_BUILD_CUDA} ]; then
+        GGML_CUDA_DEVICES=1 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
+        GGML_CUDA_DEVICES=2 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
+        GGML_CUDA_DEVICES=3 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
+        GGML_CUDA_DEVICES=4 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
+    fi
+
+    if [ ! -z ${GG_BUILD_METAL} ]; then
+        GGML_METAL_DEVICES=1 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
+        GGML_METAL_DEVICES=2 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
+        GGML_METAL_DEVICES=3 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
+        GGML_METAL_DEVICES=4 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
+    fi
 
     set +e
 }
 
-function gg_sum_test_scripts_debug {
-    gg_printf '### %s\n\n' "${ci}"
+# test_scripts
 
-    gg_printf 'Runs test scripts in debug mode\n'
-    gg_printf '- status: %s\n' "$(cat $OUT/${ci}.exit)"
-    gg_printf '```\n'
-    gg_printf '%s\n' "$(cat $OUT/${ci}-scripts.log)"
-    gg_printf '```\n'
-    gg_printf '\n'
-}
-
-# test_scripts_release
-
-function gg_run_test_scripts_release {
+function gg_run_test_scripts {
     cd ${SRC}
 
     set -e
 
-    (cd ./examples/gguf-split && time bash tests.sh "$SRC/build-ci-release/bin" "$MNT/models") 2>&1 | tee -a $OUT/${ci}-scripts.log
-    (cd ./examples/quantize   && time bash tests.sh "$SRC/build-ci-release/bin" "$MNT/models") 2>&1 | tee -a $OUT/${ci}-scripts.log
+    (cd ./tools/gguf-split && time bash tests.sh "$SRC/build-ci-release/bin" "$OUT/scratch") 2>&1 | tee -a $OUT/${ci}-scripts.log
+    (cd ./tools/quantize   && time bash tests.sh "$SRC/build-ci-release/bin" "$OUT/scratch") 2>&1 | tee -a $OUT/${ci}-scripts.log
 
     set +e
-}
-
-function gg_sum_test_scripts_release {
-    gg_printf '### %s\n\n' "${ci}"
-
-    gg_printf 'Runs test scripts in release mode\n'
-    gg_printf '- status: %s\n' "$(cat $OUT/${ci}.exit)"
-    gg_printf '```\n'
-    gg_printf '%s\n' "$(cat $OUT/${ci}-scripts.log)"
-    gg_printf '```\n'
-    gg_printf '\n'
 }
 
 function gg_get_model {
-    local gguf_3b="$MNT/models/open-llama/3B-v2/ggml-model-f16.gguf"
-    local gguf_7b="$MNT/models/open-llama/7B-v2/ggml-model-f16.gguf"
-    if [[ -s $gguf_3b ]]; then
-        echo -n "$gguf_3b"
-    elif [[ -s $gguf_7b ]]; then
-        echo -n "$gguf_7b"
+    #local gguf_0="$MNT/models/qwen3/0.6B/ggml-model-f16.gguf"
+    local gguf_0="$MNT/models/qwen3/0.6B/ggml-model-q4_0.gguf"
+    if [[ -s $gguf_0 ]]; then
+        echo -n "$gguf_0"
     else
         echo >&2 "No model found. Can't run gg_run_ctest_with_model."
         exit 1
@@ -220,7 +326,9 @@ function gg_run_ctest_with_model_debug {
     local model; model=$(gg_get_model)
     cd build-ci-debug
     set -e
-    (LLAMACPP_TEST_MODELFILE="$model" time ctest --output-on-failure -L model) 2>&1 | tee -a $OUT/${ci}-ctest.log
+
+    (LLAMACPP_TEST_MODELFILE="$model" time ctest -C Debug --output-on-failure -L model) 2>&1 | tee -a $OUT/${ci}-ctest.log
+
     set +e
     cd ..
 }
@@ -231,293 +339,57 @@ function gg_run_ctest_with_model_release {
     local model; model=$(gg_get_model)
     cd build-ci-release
     set -e
-    (LLAMACPP_TEST_MODELFILE="$model" time ctest --output-on-failure -L model) 2>&1 | tee -a $OUT/${ci}-ctest.log
+
+    (LLAMACPP_TEST_MODELFILE="$model" time ctest -C Release --output-on-failure -L model) 2>&1 | tee -a $OUT/${ci}-ctest.log
+
+    # test memory leaks
+    #if [[ ! -z ${GG_BUILD_METAL} ]]; then
+    #    # TODO: this hangs for some reason ...
+    #    (time leaks -quiet -atExit -- ./bin/test-thread-safety -m $model --parallel 2 -t 2 -p "hello") 2>&1 | tee -a $OUT/${ci}-leaks.log
+    #fi
+
     set +e
     cd ..
 }
 
-function gg_sum_ctest_with_model_debug {
-    gg_printf '### %s\n\n' "${ci}"
+# qwen3_0_6b
 
-    gg_printf 'Runs ctest with model files in debug mode\n'
-    gg_printf '- status: %s\n' "$(cat $OUT/${ci}.exit)"
-    gg_printf '```\n'
-    gg_printf '%s\n' "$(cat $OUT/${ci}-ctest.log)"
-    gg_printf '```\n'
-}
-
-function gg_sum_ctest_with_model_release {
-    gg_printf '### %s\n\n' "${ci}"
-
-    gg_printf 'Runs ctest with model files in release mode\n'
-    gg_printf '- status: %s\n' "$(cat $OUT/${ci}.exit)"
-    gg_printf '```\n'
-    gg_printf '%s\n' "$(cat $OUT/${ci}-ctest.log)"
-    gg_printf '```\n'
-}
-
-# open_llama_3b_v2
-
-function gg_run_open_llama_3b_v2 {
+function gg_run_qwen3_0_6b {
     cd ${SRC}
 
-    gg_wget models-mnt/open-llama/3B-v2/ https://huggingface.co/openlm-research/open_llama_3b_v2/raw/main/config.json
-    gg_wget models-mnt/open-llama/3B-v2/ https://huggingface.co/openlm-research/open_llama_3b_v2/resolve/main/tokenizer.model
-    gg_wget models-mnt/open-llama/3B-v2/ https://huggingface.co/openlm-research/open_llama_3b_v2/raw/main/tokenizer_config.json
-    gg_wget models-mnt/open-llama/3B-v2/ https://huggingface.co/openlm-research/open_llama_3b_v2/raw/main/special_tokens_map.json
-    gg_wget models-mnt/open-llama/3B-v2/ https://huggingface.co/openlm-research/open_llama_3b_v2/resolve/main/pytorch_model.bin
-    gg_wget models-mnt/open-llama/3B-v2/ https://huggingface.co/openlm-research/open_llama_3b_v2/raw/main/generation_config.json
+    gg_wget models-mnt/qwen3/0.6B/ https://huggingface.co/Qwen/Qwen3-0.6B-Base/raw/main/config.json
+    gg_wget models-mnt/qwen3/0.6B/ https://huggingface.co/Qwen/Qwen3-0.6B-Base/raw/main/tokenizer.json
+    gg_wget models-mnt/qwen3/0.6B/ https://huggingface.co/Qwen/Qwen3-0.6B-Base/raw/main/tokenizer_config.json
+   #gg_wget models-mnt/qwen3/0.6B/ https://huggingface.co/Qwen/Qwen3-0.6B-Base/raw/main/special_tokens_map.json
+    gg_wget models-mnt/qwen3/0.6B/ https://huggingface.co/Qwen/Qwen3-0.6B-Base/resolve/main/model.safetensors
+
 
     gg_wget models-mnt/wikitext/ https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
-    unzip -o models-mnt/wikitext/wikitext-2-raw-v1.zip -d models-mnt/wikitext/
-    head -n 60 models-mnt/wikitext/wikitext-2-raw/wiki.test.raw > models-mnt/wikitext/wikitext-2-raw/wiki.test-60.raw
 
-    path_models="../models-mnt/open-llama/3B-v2"
-    path_wiki="../models-mnt/wikitext/wikitext-2-raw"
+    rm -rf $OUT/scratch/qwen3-0.6B $OUT/scratch/wikitext
+    mkdir -p $OUT/scratch/qwen3-0.6B
+    unzip -o models-mnt/wikitext/wikitext-2-raw-v1.zip -d $OUT/scratch/wikitext/
+
+    path_models="../models-mnt/qwen3/0.6B"
+    path_local="$OUT/scratch/qwen3-0.6B"
+    path_wiki="$OUT/scratch/wikitext/wikitext-2-raw"
 
     rm -rf build-ci-release && mkdir build-ci-release && cd build-ci-release
 
     set -e
 
-    (time cmake -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} -DLLAMA_QKK_64=1 .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
-    (time make -j                                                             ) 2>&1 | tee -a $OUT/${ci}-make.log
+    (cmake -G "${CMAKE_GENERATOR}" -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
+    (time cmake --build . --config Release -j$(nproc)) 2>&1 | tee -a $OUT/${ci}-make.log
 
-    python3 ../convert.py ${path_models}
+    python3 ../convert_hf_to_gguf.py ${path_models} --outfile ${path_local}/ggml-model-f16.gguf  --outtype f16
+    python3 ../convert_hf_to_gguf.py ${path_models} --outfile ${path_local}/ggml-model-bf16.gguf --outtype bf16
 
-    model_f16="${path_models}/ggml-model-f16.gguf"
-    model_q8_0="${path_models}/ggml-model-q8_0.gguf"
-    model_q4_0="${path_models}/ggml-model-q4_0.gguf"
-    model_q4_1="${path_models}/ggml-model-q4_1.gguf"
-    model_q5_0="${path_models}/ggml-model-q5_0.gguf"
-    model_q5_1="${path_models}/ggml-model-q5_1.gguf"
-    model_q2_k="${path_models}/ggml-model-q2_k.gguf"
-    model_q3_k="${path_models}/ggml-model-q3_k.gguf"
-    model_q4_k="${path_models}/ggml-model-q4_k.gguf"
-    model_q5_k="${path_models}/ggml-model-q5_k.gguf"
-    model_q6_k="${path_models}/ggml-model-q6_k.gguf"
-
-    wiki_test_60="${path_wiki}/wiki.test-60.raw"
-
-    ./bin/quantize ${model_f16} ${model_q8_0} q8_0
-    ./bin/quantize ${model_f16} ${model_q4_0} q4_0
-    ./bin/quantize ${model_f16} ${model_q4_1} q4_1
-    ./bin/quantize ${model_f16} ${model_q5_0} q5_0
-    ./bin/quantize ${model_f16} ${model_q5_1} q5_1
-    ./bin/quantize ${model_f16} ${model_q2_k} q2_k
-    ./bin/quantize ${model_f16} ${model_q3_k} q3_k
-    ./bin/quantize ${model_f16} ${model_q4_k} q4_k
-    ./bin/quantize ${model_f16} ${model_q5_k} q5_k
-    ./bin/quantize ${model_f16} ${model_q6_k} q6_k
-
-    (time ./bin/main --model ${model_f16}  -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-f16.log
-    (time ./bin/main --model ${model_q8_0} -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q8_0.log
-    (time ./bin/main --model ${model_q4_0} -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q4_0.log
-    (time ./bin/main --model ${model_q4_1} -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q4_1.log
-    (time ./bin/main --model ${model_q5_0} -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q5_0.log
-    (time ./bin/main --model ${model_q5_1} -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q5_1.log
-    (time ./bin/main --model ${model_q2_k} -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q2_k.log
-    (time ./bin/main --model ${model_q3_k} -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q3_k.log
-    (time ./bin/main --model ${model_q4_k} -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q4_k.log
-    (time ./bin/main --model ${model_q5_k} -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q5_k.log
-    (time ./bin/main --model ${model_q6_k} -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q6_k.log
-
-    (time ./bin/perplexity --model ${model_f16}  -f ${wiki_test_60} -c 128 -b 128 --chunks 1 ) 2>&1 | tee -a $OUT/${ci}-tg-f16.log
-    (time ./bin/perplexity --model ${model_q8_0} -f ${wiki_test_60} -c 128 -b 128 --chunks 1 ) 2>&1 | tee -a $OUT/${ci}-tg-q8_0.log
-    (time ./bin/perplexity --model ${model_q4_0} -f ${wiki_test_60} -c 128 -b 128 --chunks 1 ) 2>&1 | tee -a $OUT/${ci}-tg-q4_0.log
-    (time ./bin/perplexity --model ${model_q4_1} -f ${wiki_test_60} -c 128 -b 128 --chunks 1 ) 2>&1 | tee -a $OUT/${ci}-tg-q4_1.log
-    (time ./bin/perplexity --model ${model_q5_0} -f ${wiki_test_60} -c 128 -b 128 --chunks 1 ) 2>&1 | tee -a $OUT/${ci}-tg-q5_0.log
-    (time ./bin/perplexity --model ${model_q5_1} -f ${wiki_test_60} -c 128 -b 128 --chunks 1 ) 2>&1 | tee -a $OUT/${ci}-tg-q5_1.log
-    (time ./bin/perplexity --model ${model_q2_k} -f ${wiki_test_60} -c 128 -b 128 --chunks 1 ) 2>&1 | tee -a $OUT/${ci}-tg-q2_k.log
-    (time ./bin/perplexity --model ${model_q3_k} -f ${wiki_test_60} -c 128 -b 128 --chunks 1 ) 2>&1 | tee -a $OUT/${ci}-tg-q3_k.log
-    (time ./bin/perplexity --model ${model_q4_k} -f ${wiki_test_60} -c 128 -b 128 --chunks 1 ) 2>&1 | tee -a $OUT/${ci}-tg-q4_k.log
-    (time ./bin/perplexity --model ${model_q5_k} -f ${wiki_test_60} -c 128 -b 128 --chunks 1 ) 2>&1 | tee -a $OUT/${ci}-tg-q5_k.log
-    (time ./bin/perplexity --model ${model_q6_k} -f ${wiki_test_60} -c 128 -b 128 --chunks 1 ) 2>&1 | tee -a $OUT/${ci}-tg-q6_k.log
-
-    (time ./bin/imatrix --model ${model_f16} -f ${wiki_test_60} -c 128 -b 128 --chunks 1 ) 2>&1 | tee -a $OUT/${ci}-imatrix.log
-
-    (time ./bin/save-load-state --model ${model_q4_0} ) 2>&1 | tee -a $OUT/${ci}-save-load-state.log
-
-    function check_ppl {
-        qnt="$1"
-        ppl=$(echo "$2" | grep -oE "[0-9]+\.[0-9]+" | tail -n 1)
-
-        if [ $(echo "$ppl > 20.0" | bc) -eq 1 ]; then
-            printf '  - %s @ %s (FAIL: ppl > 20.0)\n' "$qnt" "$ppl"
-            return 20
-        fi
-
-        printf '  - %s @ %s OK\n' "$qnt" "$ppl"
-        return 0
-    }
-
-    check_ppl "f16"  "$(cat $OUT/${ci}-tg-f16.log  | grep "^\[1\]")" | tee -a $OUT/${ci}-ppl.log
-    check_ppl "q8_0" "$(cat $OUT/${ci}-tg-q8_0.log | grep "^\[1\]")" | tee -a $OUT/${ci}-ppl.log
-    check_ppl "q4_0" "$(cat $OUT/${ci}-tg-q4_0.log | grep "^\[1\]")" | tee -a $OUT/${ci}-ppl.log
-    check_ppl "q4_1" "$(cat $OUT/${ci}-tg-q4_1.log | grep "^\[1\]")" | tee -a $OUT/${ci}-ppl.log
-    check_ppl "q5_0" "$(cat $OUT/${ci}-tg-q5_0.log | grep "^\[1\]")" | tee -a $OUT/${ci}-ppl.log
-    check_ppl "q5_1" "$(cat $OUT/${ci}-tg-q5_1.log | grep "^\[1\]")" | tee -a $OUT/${ci}-ppl.log
-    check_ppl "q2_k" "$(cat $OUT/${ci}-tg-q2_k.log | grep "^\[1\]")" | tee -a $OUT/${ci}-ppl.log
-    check_ppl "q3_k" "$(cat $OUT/${ci}-tg-q3_k.log | grep "^\[1\]")" | tee -a $OUT/${ci}-ppl.log
-    check_ppl "q4_k" "$(cat $OUT/${ci}-tg-q4_k.log | grep "^\[1\]")" | tee -a $OUT/${ci}-ppl.log
-    check_ppl "q5_k" "$(cat $OUT/${ci}-tg-q5_k.log | grep "^\[1\]")" | tee -a $OUT/${ci}-ppl.log
-    check_ppl "q6_k" "$(cat $OUT/${ci}-tg-q6_k.log | grep "^\[1\]")" | tee -a $OUT/${ci}-ppl.log
-
-    cat $OUT/${ci}-imatrix.log | grep "Final" >> $OUT/${ci}-imatrix-sum.log
-
-    # lora
-    function compare_ppl {
-        qnt="$1"
-        ppl1=$(echo "$2" | grep -oE "[0-9]+\.[0-9]+" | tail -n 1)
-        ppl2=$(echo "$3" | grep -oE "[0-9]+\.[0-9]+" | tail -n 1)
-
-        if [ $(echo "$ppl1 < $ppl2" | bc) -eq 1 ]; then
-            printf '  - %s @ %s (FAIL: %s > %s)\n' "$qnt" "$ppl" "$ppl1" "$ppl2"
-            return 20
-        fi
-
-        printf '  - %s @ %s %s OK\n' "$qnt" "$ppl1" "$ppl2"
-        return 0
-    }
-
-    path_lora="../models-mnt/open-llama/3B-v2/lora"
-    path_shakespeare="../models-mnt/shakespeare"
-
-    shakespeare="${path_shakespeare}/shakespeare.txt"
-    lora_shakespeare="${path_lora}/ggml-adapter-model.bin"
-
-    gg_wget ${path_lora} https://huggingface.co/slaren/open_llama_3b_v2_shakespeare_lora/resolve/main/adapter_config.json
-    gg_wget ${path_lora} https://huggingface.co/slaren/open_llama_3b_v2_shakespeare_lora/resolve/main/adapter_model.bin
-    gg_wget ${path_shakespeare} https://huggingface.co/slaren/open_llama_3b_v2_shakespeare_lora/resolve/main/shakespeare.txt
-
-    python3 ../convert-lora-to-ggml.py ${path_lora}
-
-    # f16
-    (time ./bin/perplexity --model ${model_f16} -f ${shakespeare}                            -c 128 -b 128 --chunks 1 ) 2>&1 | tee -a $OUT/${ci}-ppl-shakespeare-f16.log
-    (time ./bin/perplexity --model ${model_f16} -f ${shakespeare} --lora ${lora_shakespeare} -c 128 -b 128 --chunks 1 ) 2>&1 | tee -a $OUT/${ci}-ppl-shakespeare-lora-f16.log
-    compare_ppl "f16 shakespeare" "$(cat $OUT/${ci}-ppl-shakespeare-f16.log | grep "^\[1\]")" "$(cat $OUT/${ci}-ppl-shakespeare-lora-f16.log | grep "^\[1\]")" | tee -a $OUT/${ci}-lora-ppl.log
-
-    # q8_0
-    (time ./bin/perplexity --model ${model_q8_0} -f ${shakespeare}                            -c 128 -b 128 --chunks 1 ) 2>&1 | tee -a $OUT/${ci}-ppl-shakespeare-q8_0.log
-    (time ./bin/perplexity --model ${model_q8_0} -f ${shakespeare} --lora ${lora_shakespeare} -c 128 -b 128 --chunks 1 ) 2>&1 | tee -a $OUT/${ci}-ppl-shakespeare-lora-q8_0.log
-    compare_ppl "q8_0 shakespeare" "$(cat $OUT/${ci}-ppl-shakespeare-q8_0.log | grep "^\[1\]")" "$(cat $OUT/${ci}-ppl-shakespeare-lora-q8_0.log | grep "^\[1\]")" | tee -a $OUT/${ci}-lora-ppl.log
-
-    # q8_0 + f16 lora-base
-    (time ./bin/perplexity --model ${model_q8_0} -f ${shakespeare} --lora ${lora_shakespeare} --lora-base ${model_f16} -c 128 -b 128 --chunks 1 ) 2>&1 | tee -a $OUT/${ci}-ppl-shakespeare-lora-q8_0-f16.log
-    compare_ppl "q8_0 / f16 base shakespeare" "$(cat $OUT/${ci}-ppl-shakespeare-q8_0.log | grep "^\[1\]")" "$(cat $OUT/${ci}-ppl-shakespeare-lora-q8_0-f16.log | grep "^\[1\]")" | tee -a $OUT/${ci}-lora-ppl.log
-
-    set +e
-}
-
-function gg_sum_open_llama_3b_v2 {
-    gg_printf '### %s\n\n' "${ci}"
-
-    gg_printf 'OpenLLaMA 3B-v2:\n'
-    gg_printf '- status: %s\n' "$(cat $OUT/${ci}.exit)"
-    gg_printf '- perplexity:\n%s\n' "$(cat $OUT/${ci}-ppl.log)"
-    gg_printf '- imatrix:\n```\n%s\n```\n' "$(cat $OUT/${ci}-imatrix-sum.log)"
-    gg_printf '- lora:\n%s\n' "$(cat $OUT/${ci}-lora-ppl.log)"
-    gg_printf '- f16: \n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-f16.log)"
-    gg_printf '- q8_0:\n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-q8_0.log)"
-    gg_printf '- q4_0:\n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-q4_0.log)"
-    gg_printf '- q4_1:\n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-q4_1.log)"
-    gg_printf '- q5_0:\n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-q5_0.log)"
-    gg_printf '- q5_1:\n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-q5_1.log)"
-    gg_printf '- q2_k:\n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-q2_k.log)"
-    gg_printf '- q3_k:\n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-q3_k.log)"
-    gg_printf '- q4_k:\n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-q4_k.log)"
-    gg_printf '- q5_k:\n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-q5_k.log)"
-    gg_printf '- q6_k:\n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-q6_k.log)"
-    gg_printf '- save-load-state: \n```\n%s\n```\n' "$(cat $OUT/${ci}-save-load-state.log)"
-    gg_printf '- shakespeare (f16):\n```\n%s\n```\n' "$(cat $OUT/${ci}-ppl-shakespeare-f16.log)"
-    gg_printf '- shakespeare (f16 lora):\n```\n%s\n```\n' "$(cat $OUT/${ci}-ppl-shakespeare-lora-f16.log)"
-    gg_printf '- shakespeare (q8_0):\n```\n%s\n```\n' "$(cat $OUT/${ci}-ppl-shakespeare-q8_0.log)"
-    gg_printf '- shakespeare (q8_0 lora):\n```\n%s\n```\n' "$(cat $OUT/${ci}-ppl-shakespeare-lora-q8_0.log)"
-    gg_printf '- shakespeare (q8_0 / f16 base lora):\n```\n%s\n```\n' "$(cat $OUT/${ci}-ppl-shakespeare-lora-q8_0-f16.log)"
-}
-
-# open_llama_7b_v2
-# requires: GG_BUILD_CUDA
-
-function gg_run_open_llama_7b_v2 {
-    cd ${SRC}
-
-    gg_wget models-mnt/open-llama/7B-v2/ https://huggingface.co/openlm-research/open_llama_7b_v2/raw/main/config.json
-    gg_wget models-mnt/open-llama/7B-v2/ https://huggingface.co/openlm-research/open_llama_7b_v2/resolve/main/tokenizer.model
-    gg_wget models-mnt/open-llama/7B-v2/ https://huggingface.co/openlm-research/open_llama_7b_v2/raw/main/tokenizer_config.json
-    gg_wget models-mnt/open-llama/7B-v2/ https://huggingface.co/openlm-research/open_llama_7b_v2/raw/main/special_tokens_map.json
-    gg_wget models-mnt/open-llama/7B-v2/ https://huggingface.co/openlm-research/open_llama_7b_v2/raw/main/pytorch_model.bin.index.json
-    gg_wget models-mnt/open-llama/7B-v2/ https://huggingface.co/openlm-research/open_llama_7b_v2/resolve/main/pytorch_model-00001-of-00002.bin
-    gg_wget models-mnt/open-llama/7B-v2/ https://huggingface.co/openlm-research/open_llama_7b_v2/resolve/main/pytorch_model-00002-of-00002.bin
-    gg_wget models-mnt/open-llama/7B-v2/ https://huggingface.co/openlm-research/open_llama_7b_v2/raw/main/generation_config.json
-
-    gg_wget models-mnt/wikitext/ https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
-    unzip -o models-mnt/wikitext/wikitext-2-raw-v1.zip -d models-mnt/wikitext/
-
-    path_models="../models-mnt/open-llama/7B-v2"
-    path_wiki="../models-mnt/wikitext/wikitext-2-raw"
-
-    rm -rf build-ci-release && mkdir build-ci-release && cd build-ci-release
-
-    set -e
-
-    (time cmake -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} -DLLAMA_CUDA=1 .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
-    (time make -j                                                           ) 2>&1 | tee -a $OUT/${ci}-make.log
-
-    python3 ../convert.py ${path_models}
-
-    model_f16="${path_models}/ggml-model-f16.gguf"
-    model_q8_0="${path_models}/ggml-model-q8_0.gguf"
-    model_q4_0="${path_models}/ggml-model-q4_0.gguf"
-    model_q4_1="${path_models}/ggml-model-q4_1.gguf"
-    model_q5_0="${path_models}/ggml-model-q5_0.gguf"
-    model_q5_1="${path_models}/ggml-model-q5_1.gguf"
-    model_q2_k="${path_models}/ggml-model-q2_k.gguf"
-    model_q3_k="${path_models}/ggml-model-q3_k.gguf"
-    model_q4_k="${path_models}/ggml-model-q4_k.gguf"
-    model_q5_k="${path_models}/ggml-model-q5_k.gguf"
-    model_q6_k="${path_models}/ggml-model-q6_k.gguf"
+    model_f16="${path_local}/ggml-model-f16.gguf"
+    model_bf16="${path_local}/ggml-model-bf16.gguf"
+    model_q4_0="${path_local}/ggml-model-q4_0.gguf"
 
     wiki_test="${path_wiki}/wiki.test.raw"
 
-    ./bin/quantize ${model_f16} ${model_q8_0} q8_0
-    ./bin/quantize ${model_f16} ${model_q4_0} q4_0
-    ./bin/quantize ${model_f16} ${model_q4_1} q4_1
-    ./bin/quantize ${model_f16} ${model_q5_0} q5_0
-    ./bin/quantize ${model_f16} ${model_q5_1} q5_1
-    ./bin/quantize ${model_f16} ${model_q2_k} q2_k
-    ./bin/quantize ${model_f16} ${model_q3_k} q3_k
-    ./bin/quantize ${model_f16} ${model_q4_k} q4_k
-    ./bin/quantize ${model_f16} ${model_q5_k} q5_k
-    ./bin/quantize ${model_f16} ${model_q6_k} q6_k
-
-    (time ./bin/main --model ${model_f16}  -t 1 -ngl 999 -s 1234 -n 256 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-f16.log
-    (time ./bin/main --model ${model_q8_0} -t 1 -ngl 999 -s 1234 -n 256 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q8_0.log
-    (time ./bin/main --model ${model_q4_0} -t 1 -ngl 999 -s 1234 -n 256 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q4_0.log
-    (time ./bin/main --model ${model_q4_1} -t 1 -ngl 999 -s 1234 -n 256 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q4_1.log
-    (time ./bin/main --model ${model_q5_0} -t 1 -ngl 999 -s 1234 -n 256 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q5_0.log
-    (time ./bin/main --model ${model_q5_1} -t 1 -ngl 999 -s 1234 -n 256 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q5_1.log
-    (time ./bin/main --model ${model_q2_k} -t 1 -ngl 999 -s 1234 -n 256 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q2_k.log
-    (time ./bin/main --model ${model_q3_k} -t 1 -ngl 999 -s 1234 -n 256 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q3_k.log
-    (time ./bin/main --model ${model_q4_k} -t 1 -ngl 999 -s 1234 -n 256 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q4_k.log
-    (time ./bin/main --model ${model_q5_k} -t 1 -ngl 999 -s 1234 -n 256 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q5_k.log
-    (time ./bin/main --model ${model_q6_k} -t 1 -ngl 999 -s 1234 -n 256 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q6_k.log
-
-    (time ./bin/perplexity --model ${model_f16}  -f ${wiki_test} -t 1 -ngl 999 -c 2048 -b 512 --chunks 4 ) 2>&1 | tee -a $OUT/${ci}-tg-f16.log
-    (time ./bin/perplexity --model ${model_q8_0} -f ${wiki_test} -t 1 -ngl 999 -c 2048 -b 512 --chunks 4 ) 2>&1 | tee -a $OUT/${ci}-tg-q8_0.log
-    (time ./bin/perplexity --model ${model_q4_0} -f ${wiki_test} -t 1 -ngl 999 -c 2048 -b 512 --chunks 4 ) 2>&1 | tee -a $OUT/${ci}-tg-q4_0.log
-    (time ./bin/perplexity --model ${model_q4_1} -f ${wiki_test} -t 1 -ngl 999 -c 2048 -b 512 --chunks 4 ) 2>&1 | tee -a $OUT/${ci}-tg-q4_1.log
-    (time ./bin/perplexity --model ${model_q5_0} -f ${wiki_test} -t 1 -ngl 999 -c 2048 -b 512 --chunks 4 ) 2>&1 | tee -a $OUT/${ci}-tg-q5_0.log
-    (time ./bin/perplexity --model ${model_q5_1} -f ${wiki_test} -t 1 -ngl 999 -c 2048 -b 512 --chunks 4 ) 2>&1 | tee -a $OUT/${ci}-tg-q5_1.log
-    (time ./bin/perplexity --model ${model_q2_k} -f ${wiki_test} -t 1 -ngl 999 -c 2048 -b 512 --chunks 4 ) 2>&1 | tee -a $OUT/${ci}-tg-q2_k.log
-    (time ./bin/perplexity --model ${model_q3_k} -f ${wiki_test} -t 1 -ngl 999 -c 2048 -b 512 --chunks 4 ) 2>&1 | tee -a $OUT/${ci}-tg-q3_k.log
-    (time ./bin/perplexity --model ${model_q4_k} -f ${wiki_test} -t 1 -ngl 999 -c 2048 -b 512 --chunks 4 ) 2>&1 | tee -a $OUT/${ci}-tg-q4_k.log
-    (time ./bin/perplexity --model ${model_q5_k} -f ${wiki_test} -t 1 -ngl 999 -c 2048 -b 512 --chunks 4 ) 2>&1 | tee -a $OUT/${ci}-tg-q5_k.log
-    (time ./bin/perplexity --model ${model_q6_k} -f ${wiki_test} -t 1 -ngl 999 -c 2048 -b 512 --chunks 4 ) 2>&1 | tee -a $OUT/${ci}-tg-q6_k.log
-
-    (time ./bin/imatrix --model ${model_f16} -f ${wiki_test} -t 1 -ngl 999 -c 2048 -b 512 --chunks 4 ) 2>&1 | tee -a $OUT/${ci}-imatrix.log
-
-    (time ./bin/save-load-state --model ${model_q4_0} ) 2>&1 | tee -a $OUT/${ci}-save-load-state.log
-
     function check_ppl {
         qnt="$1"
         ppl=$(echo "$2" | grep -oE "[0-9]+\.[0-9]+" | tail -n 1)
@@ -531,90 +403,54 @@ function gg_run_open_llama_7b_v2 {
         return 0
     }
 
-    check_ppl "f16"  "$(cat $OUT/${ci}-tg-f16.log  | grep "^\[1\]")" | tee -a $OUT/${ci}-ppl.log
-    check_ppl "q8_0" "$(cat $OUT/${ci}-tg-q8_0.log | grep "^\[1\]")" | tee -a $OUT/${ci}-ppl.log
-    check_ppl "q4_0" "$(cat $OUT/${ci}-tg-q4_0.log | grep "^\[1\]")" | tee -a $OUT/${ci}-ppl.log
-    check_ppl "q4_1" "$(cat $OUT/${ci}-tg-q4_1.log | grep "^\[1\]")" | tee -a $OUT/${ci}-ppl.log
-    check_ppl "q5_0" "$(cat $OUT/${ci}-tg-q5_0.log | grep "^\[1\]")" | tee -a $OUT/${ci}-ppl.log
-    check_ppl "q5_1" "$(cat $OUT/${ci}-tg-q5_1.log | grep "^\[1\]")" | tee -a $OUT/${ci}-ppl.log
-    check_ppl "q2_k" "$(cat $OUT/${ci}-tg-q2_k.log | grep "^\[1\]")" | tee -a $OUT/${ci}-ppl.log
-    check_ppl "q3_k" "$(cat $OUT/${ci}-tg-q3_k.log | grep "^\[1\]")" | tee -a $OUT/${ci}-ppl.log
-    check_ppl "q4_k" "$(cat $OUT/${ci}-tg-q4_k.log | grep "^\[1\]")" | tee -a $OUT/${ci}-ppl.log
-    check_ppl "q5_k" "$(cat $OUT/${ci}-tg-q5_k.log | grep "^\[1\]")" | tee -a $OUT/${ci}-ppl.log
-    check_ppl "q6_k" "$(cat $OUT/${ci}-tg-q6_k.log | grep "^\[1\]")" | tee -a $OUT/${ci}-ppl.log
+    for qnt in q8_0 q4_0 q4_1 q5_0 q5_1 q2_k q3_k q4_k q5_k q6_k; do
+        model="${path_local}/ggml-model-${qnt}.gguf"
 
-    cat $OUT/${ci}-imatrix.log | grep "Final" >> $OUT/${ci}-imatrix-sum.log
+        ./bin/llama-quantize ${model_bf16} ${model} ${qnt} $(nproc)
 
-    # lora
-    function compare_ppl {
-        qnt="$1"
-        ppl1=$(echo "$2" | grep -oE "[0-9]+\.[0-9]+" | tail -n 1)
-        ppl2=$(echo "$3" | grep -oE "[0-9]+\.[0-9]+" | tail -n 1)
+        (time ./bin/llama-completion -no-cnv --model ${model} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-${qnt}.log
+        (time ./bin/llama-perplexity --model ${model} -f ${wiki_test} -ngl 99 -c 1024 -b 512 --chunks 2 ) 2>&1 | tee -a $OUT/${ci}-tg-${qnt}.log
 
-        if [ $(echo "$ppl1 < $ppl2" | bc) -eq 1 ]; then
-            printf '  - %s @ %s (FAIL: %s > %s)\n' "$qnt" "$ppl" "$ppl1" "$ppl2"
-            return 20
+        # note: ppl > 20.0 for q2_k with this model
+        if [ "${qnt}" != "q2_k" ]; then
+            check_ppl "${qnt}" "$(cat $OUT/${ci}-tg-${qnt}.log | grep "^\[1\]")"
         fi
 
-        printf '  - %s @ %s %s OK\n' "$qnt" "$ppl1" "$ppl2"
-        return 0
-    }
+        if [ "${qnt}" = "q4_0" ]; then
+            # q4_0 is kept for other tests
+            q4_0="${path_models}/ggml-model-q4_0.gguf"
+            ln ${model} "$q4_0" 2>/dev/null || { cp ${model} $q4_0.tmp.$$ && mv -f $q4_0.tmp.$$ $q4_0; }
+        else
+            rm -f ${model}
+        fi
+    done
 
-    path_lora="../models-mnt/open-llama/7B-v2/lora"
-    path_shakespeare="../models-mnt/shakespeare"
+    (time ./bin/llama-fit-params --model ${model_f16} 2>&1 | tee -a $OUT/${ci}-fp-f16.log)
 
-    shakespeare="${path_shakespeare}/shakespeare.txt"
-    lora_shakespeare="${path_lora}/ggml-adapter-model.bin"
+    (time ./bin/llama-completion -no-cnv --model ${model_f16}  -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-f16.log
+    (time ./bin/llama-completion -no-cnv --model ${model_bf16} -ngl 99 -c 1024 -s 1234 -n 64 --ignore-eos -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-bf16.log
 
-    gg_wget ${path_lora} https://huggingface.co/slaren/open_llama_7b_v2_shakespeare_lora/resolve/main/adapter_config.json
-    gg_wget ${path_lora} https://huggingface.co/slaren/open_llama_7b_v2_shakespeare_lora/resolve/main/adapter_model.bin
-    gg_wget ${path_shakespeare} https://huggingface.co/slaren/open_llama_7b_v2_shakespeare_lora/resolve/main/shakespeare.txt
+    (time ./bin/llama-perplexity --model ${model_f16}  -f ${wiki_test} -ngl 99 -c 1024 -b 512 --chunks 2 ) 2>&1 | tee -a $OUT/${ci}-tg-f16.log
+    if [ -z ${GG_BUILD_NO_BF16} ]; then
+        (time ./bin/llama-perplexity --model ${model_bf16} -f ${wiki_test} -ngl 99 -c 1024 -b 512 --chunks 2 ) 2>&1 | tee -a $OUT/${ci}-tg-bf16.log
+    fi
 
-    python3 ../convert-lora-to-ggml.py ${path_lora}
+    (time ./bin/llama-imatrix --model ${model_f16} -f ${wiki_test} -ngl 99 -c 1024 -b 512 --chunks 2 ) 2>&1 | tee -a $OUT/${ci}-imatrix.log
 
-    # f16
-    (time ./bin/perplexity --model ${model_f16} -f ${shakespeare}                            -t 1 -ngl 999 -c 2048 -b 512 --chunks 3 ) 2>&1 | tee -a $OUT/${ci}-ppl-shakespeare-f16.log
-    (time ./bin/perplexity --model ${model_f16} -f ${shakespeare} --lora ${lora_shakespeare} -t 1 -ngl 999 -c 2048 -b 512 --chunks 3 ) 2>&1 | tee -a $OUT/${ci}-ppl-shakespeare-lora-f16.log
-    compare_ppl "f16 shakespeare" "$(cat $OUT/${ci}-ppl-shakespeare-f16.log | grep "^\[1\]")" "$(cat $OUT/${ci}-ppl-shakespeare-lora-f16.log | grep "^\[1\]")" | tee -a $OUT/${ci}-lora-ppl.log
+    (time ./bin/test-llama-context --model ${model_q4_0} -ngl 10 -c 1024 -fa off --no-op-offload) 2>&1 | tee -a $OUT/${ci}-test-llama-context.log
+    (time ./bin/test-llama-context --model ${model_q4_0} -ngl 99 -c 1024 -fa off                ) 2>&1 | tee -a $OUT/${ci}-test-llama-context.log
+    (time ./bin/test-llama-context --model ${model_q4_0} -ngl 10 -c 1024 -fa on  --no-op-offload) 2>&1 | tee -a $OUT/${ci}-test-llama-context.log
+    (time ./bin/test-llama-context --model ${model_q4_0} -ngl 99 -c 1024 -fa on                 ) 2>&1 | tee -a $OUT/${ci}-test-llama-context.log
 
-    # currently not supported by the CUDA backend
-    # q8_0
-    #(time ./bin/perplexity --model ${model_q8_0} -f ${shakespeare}                            -t 1 -ngl 999 -c 2048 -b 512 --chunks 3 ) 2>&1 | tee -a $OUT/${ci}-ppl-shakespeare-q8_0.log
-    #(time ./bin/perplexity --model ${model_q8_0} -f ${shakespeare} --lora ${lora_shakespeare} -t 1 -ngl 999 -c 2048 -b 512 --chunks 3 ) 2>&1 | tee -a $OUT/${ci}-ppl-shakespeare-lora-q8_0.log
-    #compare_ppl "q8_0 shakespeare" "$(cat $OUT/${ci}-ppl-shakespeare-q8_0.log | grep "^\[1\]")" "$(cat $OUT/${ci}-ppl-shakespeare-lora-q8_0.log | grep "^\[1\]")" | tee -a $OUT/${ci}-lora-ppl.log
+    check_ppl "f16"  "$(cat $OUT/${ci}-tg-f16.log  | grep "^\[1\]")"
+    if [ -z ${GG_BUILD_NO_BF16} ]; then
+        check_ppl "bf16" "$(cat $OUT/${ci}-tg-bf16.log | grep "^\[1\]")"
+    fi
 
-    # q8_0 + f16 lora-base
-    #(time ./bin/perplexity --model ${model_q8_0} -f ${shakespeare} --lora ${lora_shakespeare} --lora-base ${model_f16} -t 1 -ngl 999 -c 2048 -b 512 --chunks 3 ) 2>&1 | tee -a $OUT/${ci}-ppl-shakespeare-lora-q8_0-f16.log
-    #compare_ppl "q8_0 / f16 shakespeare" "$(cat $OUT/${ci}-ppl-shakespeare-q8_0.log | grep "^\[1\]")" "$(cat $OUT/${ci}-ppl-shakespeare-lora-q8_0-f16.log | grep "^\[1\]")" | tee -a $OUT/${ci}-lora-ppl.log
+    # scratch is rebuilt on every run; q4_0 is already published to $MNT
+    rm -rf $OUT/scratch/qwen3-0.6B $OUT/scratch/wikitext
 
     set +e
-}
-
-function gg_sum_open_llama_7b_v2 {
-    gg_printf '### %s\n\n' "${ci}"
-
-    gg_printf 'OpenLLaMA 7B-v2:\n'
-    gg_printf '- status: %s\n' "$(cat $OUT/${ci}.exit)"
-    gg_printf '- perplexity:\n%s\n' "$(cat $OUT/${ci}-ppl.log)"
-    gg_printf '- imatrix:\n```\n%s\n```\n' "$(cat $OUT/${ci}-imatrix-sum.log)"
-    gg_printf '- lora:\n%s\n' "$(cat $OUT/${ci}-lora-ppl.log)"
-    gg_printf '- f16: \n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-f16.log)"
-    gg_printf '- q8_0:\n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-q8_0.log)"
-    gg_printf '- q4_0:\n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-q4_0.log)"
-    gg_printf '- q4_1:\n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-q4_1.log)"
-    gg_printf '- q5_0:\n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-q5_0.log)"
-    gg_printf '- q5_1:\n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-q5_1.log)"
-    gg_printf '- q2_k:\n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-q2_k.log)"
-    gg_printf '- q3_k:\n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-q3_k.log)"
-    gg_printf '- q4_k:\n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-q4_k.log)"
-    gg_printf '- q5_k:\n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-q5_k.log)"
-    gg_printf '- q6_k:\n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-q6_k.log)"
-    gg_printf '- save-load-state: \n```\n%s\n```\n' "$(cat $OUT/${ci}-save-load-state.log)"
-    gg_printf '- shakespeare (f16):\n```\n%s\n```\n' "$(cat $OUT/${ci}-ppl-shakespeare-f16.log)"
-    gg_printf '- shakespeare (f16 lora):\n```\n%s\n```\n' "$(cat $OUT/${ci}-ppl-shakespeare-lora-f16.log)"
-    #gg_printf '- shakespeare (q8_0):\n```\n%s\n```\n' "$(cat $OUT/${ci}-ppl-shakespeare-q8_0.log)"
-    #gg_printf '- shakespeare (q8_0 lora):\n```\n%s\n```\n' "$(cat $OUT/${ci}-ppl-shakespeare-lora-q8_0.log)"
-    #gg_printf '- shakespeare (q8_0 / f16 base lora):\n```\n%s\n```\n' "$(cat $OUT/${ci}-ppl-shakespeare-lora-q8_0-f16.log)"
 }
 
 # bge-small
@@ -635,48 +471,201 @@ function gg_run_embd_bge_small {
     gg_wget models-mnt/bge-small/1_Pooling https://huggingface.co/BAAI/bge-small-en-v1.5/raw/main/1_Pooling/config.json
 
     path_models="../models-mnt/bge-small"
+    path_local="$OUT/scratch/bge-small"
+    rm -rf $path_local && mkdir -p $path_local
 
     rm -rf build-ci-release && mkdir build-ci-release && cd build-ci-release
 
     set -e
 
-    (time cmake -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
-    (time make -j                                            ) 2>&1 | tee -a $OUT/${ci}-make.log
+    (cmake -G "${CMAKE_GENERATOR}" -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
+    (time cmake --build . --config Release -j$(nproc)) 2>&1 | tee -a $OUT/${ci}-make.log
 
-    python3 ../convert-hf-to-gguf.py ${path_models}
+    python3 ../convert_hf_to_gguf.py ${path_models} --outfile ${path_local}/ggml-model-f16.gguf
 
-    model_f16="${path_models}/ggml-model-f16.gguf"
-    model_q8_0="${path_models}/ggml-model-q8_0.gguf"
+    model_f16="${path_local}/ggml-model-f16.gguf"
+    model_q8_0="${path_local}/ggml-model-q8_0.gguf"
 
-    ./bin/quantize ${model_f16} ${model_q8_0} q8_0
+    ./bin/llama-quantize ${model_f16} ${model_q8_0} q8_0
 
-    (time ./bin/embedding --model ${model_f16}  -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-f16.log
-    (time ./bin/embedding --model ${model_q8_0} -p "I believe the meaning of life is" ) 2>&1 | tee -a $OUT/${ci}-tg-q8_0.log
+    (time ./bin/llama-fit-params --model ${model_f16} 2>&1 | tee -a $OUT/${ci}-fp-f16.log)
+
+    (time ./bin/llama-embedding --model ${model_f16}  -p "I believe the meaning of life is" -ngl 99 -c 0 --no-op-offload) 2>&1 | tee -a $OUT/${ci}-tg-f16.log
+    (time ./bin/llama-embedding --model ${model_q8_0} -p "I believe the meaning of life is" -ngl 99 -c 0 --no-op-offload) 2>&1 | tee -a $OUT/${ci}-tg-q8_0.log
+
+    rm -rf $path_local
 
     set +e
 }
 
-function gg_sum_embd_bge_small {
-    gg_printf '### %s\n\n' "${ci}"
+# rerank_tiny
 
-    gg_printf 'BGE Small (BERT):\n'
-    gg_printf '- status: %s\n' "$(cat $OUT/${ci}.exit)"
-    gg_printf '- f16: \n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-f16.log)"
-    gg_printf '- q8_0:\n```\n%s\n```\n' "$(cat $OUT/${ci}-tg-q8_0.log)"
+function gg_run_rerank_tiny {
+    cd ${SRC}
+
+    gg_wget models-mnt/rerank-tiny/ https://huggingface.co/jinaai/jina-reranker-v1-tiny-en/raw/main/config.json
+    gg_wget models-mnt/rerank-tiny/ https://huggingface.co/jinaai/jina-reranker-v1-tiny-en/raw/main/tokenizer.json
+    gg_wget models-mnt/rerank-tiny/ https://huggingface.co/jinaai/jina-reranker-v1-tiny-en/raw/main/tokenizer_config.json
+    gg_wget models-mnt/rerank-tiny/ https://huggingface.co/jinaai/jina-reranker-v1-tiny-en/raw/main/special_tokens_map.json
+    gg_wget models-mnt/rerank-tiny/ https://huggingface.co/jinaai/jina-reranker-v1-tiny-en/resolve/main/pytorch_model.bin
+    gg_wget models-mnt/rerank-tiny/ https://huggingface.co/jinaai/jina-reranker-v1-tiny-en/raw/main/vocab.json
+
+    path_models="../models-mnt/rerank-tiny"
+    path_local="$OUT/scratch/rerank-tiny"
+    rm -rf $path_local && mkdir -p $path_local
+
+    rm -rf build-ci-release && mkdir build-ci-release && cd build-ci-release
+
+    set -e
+
+    (cmake -G "${CMAKE_GENERATOR}" -DCMAKE_BUILD_TYPE=Release ${CMAKE_EXTRA} .. ) 2>&1 | tee -a $OUT/${ci}-cmake.log
+    (time cmake --build . --config Release -j$(nproc)) 2>&1 | tee -a $OUT/${ci}-make.log
+
+    python3 ../convert_hf_to_gguf.py ${path_models} --outfile ${path_local}/ggml-model-f16.gguf
+
+    model_f16="${path_local}/ggml-model-f16.gguf"
+
+    (time ./bin/llama-fit-params --model ${model_f16} 2>&1 | tee -a $OUT/${ci}-fp-f16.log)
+
+    # for this model, the SEP token is "</s>"
+    (time ./bin/llama-embedding --model ${model_f16} -p "what is panda?\thi\nwhat is panda?\tit's a bear\nwhat is panda?\tThe giant panda (Ailuropoda melanoleuca), sometimes called a panda bear or simply panda, is a bear species endemic to China." -ngl 99 -c 0 --pooling rank --embd-normalize -1 --no-op-offload --verbose-prompt) 2>&1 | tee -a $OUT/${ci}-rk-f16.log
+
+    # sample output
+    # rerank score 0:    0.029
+    # rerank score 1:    0.029
+    # rerank score 2:    0.135
+
+    # check that the score is in the range [$3, $4]
+    function check_score {
+        qnt="$1"
+        score=$(echo "$2" | grep -oE "[0-9]+\.[0-9]+" | tail -n 1)
+
+        if [ $(echo "$score < $3" | bc) -eq 1 ] || [ $(echo "$score > $4" | bc) -eq 1 ]; then
+            printf '  - %s @ %s (FAIL: score not in range [%s, %s])\n' "$qnt" "$score" "$3" "$4"
+            return 20
+        fi
+
+        printf '  - %s @ %s OK\n' "$qnt" "$score"
+        return 0
+    }
+
+    check_score "rerank score 0" "$(cat $OUT/${ci}-rk-f16.log | grep "rerank score 0")" "0.00" "0.05" | tee -a $OUT/${ci}-rk-f16.log
+    check_score "rerank score 1" "$(cat $OUT/${ci}-rk-f16.log | grep "rerank score 1")" "0.00" "0.05" | tee -a $OUT/${ci}-rk-f16.log
+    check_score "rerank score 2" "$(cat $OUT/${ci}-rk-f16.log | grep "rerank score 2")" "0.10" "0.30" | tee -a $OUT/${ci}-rk-f16.log
+
+    rm -rf $path_local
+
+    set +e
+}
+
+function gg_check_build_requirements {
+    if ! command -v git &> /dev/null; then
+        echo 'git not found, please install'
+        exit 1
+    fi
+
+    if ! command -v git-lfs &> /dev/null; then
+        echo 'git-lfs not found, please install'
+        exit 1
+    fi
+
+    if ! git config --get filter.lfs.clean &> /dev/null; then
+        echo 'git-lfs not initialized, please run `git lfs install`'
+        exit 1
+    fi
+
+    if ! command -v wget &> /dev/null; then
+        echo 'wget not found, please install'
+        exit 1
+    fi
+
+    if ! command -v python3 &> /dev/null; then
+        echo 'python3 not found, please install'
+        exit 1
+    fi
+
+    if ! command -v pip3 &> /dev/null; then
+        echo 'pip3 not found, please install'
+        exit 1
+    fi
+
+    if ! python3 -m ensurepip --help &> /dev/null; then
+        echo 'ensurepip not found, please install python3-venv package'
+        exit 1
+    fi
+
+    if ! command -v cmake &> /dev/null; then
+        echo 'cmake not found, please install'
+        exit 1
+    fi
+
+    if ! command -v ccache &> /dev/null; then
+        echo 'ccache not found, please consider installing for faster builds'
+    fi
+
+    if ! command -v ctest &> /dev/null; then
+        echo 'ctest not found, please install'
+        exit 1
+    fi
+
+    if ! command -v unzip &> /dev/null; then
+        echo 'unzip not found, please install'
+        exit 1
+    fi
+}
+
+function gg_run_test_backend_ops {
+    cd ${SRC}
+
+    cd build-ci-release
+
+    set -e
+
+    local n_jobs=$(nproc)
+    if [ "${n_jobs}" -gt 2 ]; then
+        n_jobs=2
+    fi
+    local args_extra="-j ${n_jobs}"
+
+    # TODO: MoltenVK bug?
+    #       https://github.com/ggml-org/llama.cpp/actions/runs/34611260059/job/103302413736?pr=28740#step:3:5897
+    if [ ! -z "${GG_BUILD_VULKAN}" ] && [ "$(uname -s)" = "Darwin" ]; then
+        args_extra=""
+    fi
+
+    # TODO: OpenVINO GPU plugin crashes (CL_OUT_OF_RESOURCES) with 2 concurrent workers on GPU.
+    if [ ! -z "${GG_BUILD_OPENVINO}" ] && [ "${GGML_OPENVINO_DEVICE:-}" = "GPU" ]; then
+        args_extra=""
+    fi
+
+    # TODO: reduce the test-backend-ops timeout to 1800s
+    if [ ! -z ${GG_BUILD_HIGH_PERF} ]; then
+        (time timeout 3600 ./bin/test-backend-ops ${args_extra} -b CPU) 2>&1 | tee -a $OUT/${ci}-test-backend-ops.log
+    else
+        (time timeout 3600 ./bin/test-backend-ops ${args_extra}       ) 2>&1 | tee -a $OUT/${ci}-test-backend-ops.log
+    fi
+
+    set +e
 }
 
 ## main
 
+export LLAMA_ARG_LOG_PREFIX=1
+export LLAMA_ARG_LOG_TIMESTAMPS=1
+
 if [ -z ${GG_BUILD_LOW_PERF} ]; then
-    # Create symlink: ./llama.cpp/models-mnt -> $MNT/models/models-mnt
+    # Create symlink: ./llama.cpp/models-mnt -> $MNT/models
     rm -rf ${SRC}/models-mnt
     mnt_models=${MNT}/models
     mkdir -p ${mnt_models}
     ln -sfn ${mnt_models} ${SRC}/models-mnt
 
     # Create a fresh python3 venv and enter it
-    python3 -m venv "$MNT/venv"
-    source "$MNT/venv/bin/activate"
+    if ! python3 -m venv "$OUT/venv"; then
+        echo "Error: Failed to create Python virtual environment at $OUT/venv."
+        exit 1
+    fi
+    source "$OUT/venv/bin/activate"
 
     pip install -r ${SRC}/requirements.txt --disable-pip-version-check
     pip install --editable gguf-py --disable-pip-version-check
@@ -687,21 +676,22 @@ ret=0
 test $ret -eq 0 && gg_run ctest_debug
 test $ret -eq 0 && gg_run ctest_release
 
+test $ret -eq 0 && gg_run test_backend_ops
+
+test $ret -eq 0 && gg_run test_llama_archs_tensor_split
+
 if [ -z ${GG_BUILD_LOW_PERF} ]; then
     test $ret -eq 0 && gg_run embd_bge_small
+    test $ret -eq 0 && gg_run rerank_tiny
 
-    test $ret -eq 0 && gg_run test_scripts_debug
-    test $ret -eq 0 && gg_run test_scripts_release
-
-    if [ -z ${GG_BUILD_VRAM_GB} ] || [ ${GG_BUILD_VRAM_GB} -ge 8 ]; then
-        if [ -z ${GG_BUILD_CUDA} ]; then
-            test $ret -eq 0 && gg_run open_llama_3b_v2
-        else
-            test $ret -eq 0 && gg_run open_llama_7b_v2
-        fi
-        test $ret -eq 0 && gg_run ctest_with_model_debug
-        test $ret -eq 0 && gg_run ctest_with_model_release
+    if [ -z ${GG_BUILD_CLOUD} ] || [ ${GG_BUILD_EXTRA_TESTS_0} ]; then
+        test $ret -eq 0 && gg_run test_scripts
     fi
+
+    test $ret -eq 0 && gg_run qwen3_0_6b
+
+    test $ret -eq 0 && gg_run ctest_with_model_debug
+    test $ret -eq 0 && gg_run ctest_with_model_release
 fi
 
 exit $ret

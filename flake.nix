@@ -36,9 +36,6 @@
   # ```
   # nixConfig = {
   #   extra-substituters = [
-  #     # Populated by the CI in ggerganov/llama.cpp
-  #     "https://llama-cpp.cachix.org"
-  #
   #     # A development cache for nixpkgs imported with `config.cudaSupport = true`.
   #     # Populated by https://hercules-ci.com/github/SomeoneSerge/nixpkgs-cuda-ci.
   #     # This lets one skip building e.g. the CUDA-enabled openmpi.
@@ -47,23 +44,21 @@
   #   ];
   #
   #   # Verify these are the same keys as published on
-  #   # - https://app.cachix.org/cache/llama-cpp
   #   # - https://app.cachix.org/cache/cuda-maintainers
   #   extra-trusted-public-keys = [
-  #     "llama-cpp.cachix.org-1:H75X+w83wUKTIPSO1KWy9ADUrzThyGs8P5tmAbkWhQc="
   #     "cuda-maintainers.cachix.org-1:0dq3bujKpuEPMCX6U4WylrUDZ9JyUG0VpVZa7CNfq5E="
   #   ];
   # };
   # ```
 
-  # For inspection, use `nix flake show github:ggerganov/llama.cpp` or the nix repl:
+  # For inspection, use `nix flake show github:ggml-org/llama.cpp` or the nix repl:
   #
   # ```bash
   # ❯ nix repl
-  # nix-repl> :lf github:ggerganov/llama.cpp
+  # nix-repl> :lf github:ggml-org/llama.cpp
   # Added 13 variables.
   # nix-repl> outputs.apps.x86_64-linux.quantize
-  # { program = "/nix/store/00000000000000000000000000000000-llama.cpp/bin/quantize"; type = "app"; }
+  # { program = "/nix/store/00000000000000000000000000000000-llama.cpp/bin/llama-quantize"; type = "app"; }
   # ```
   outputs =
     { self, flake-parts, ... }@inputs:
@@ -133,7 +128,7 @@
           }:
           {
             # For standardised reproducible formatting with `nix fmt`
-            formatter = pkgs.nixfmt-rfc-style;
+            formatter = pkgs.nixfmt;
 
             # Unlike `.#packages`, legacyPackages may contain values of
             # arbitrary types (including nested attrsets) and may even throw
@@ -145,7 +140,9 @@
             # the same path you would with an overlay.
             legacyPackages = {
               llamaPackages = pkgs.callPackage .devops/nix/scope.nix { inherit llamaVersion; };
-              llamaPackagesWindows = pkgs.pkgsCross.mingwW64.callPackage .devops/nix/scope.nix { inherit llamaVersion; };
+              llamaPackagesWindows = pkgs.pkgsCross.mingwW64.callPackage .devops/nix/scope.nix {
+                inherit llamaVersion;
+              };
               llamaPackagesCuda = pkgsCuda.callPackage .devops/nix/scope.nix { inherit llamaVersion; };
               llamaPackagesRocm = pkgsRocm.callPackage .devops/nix/scope.nix { inherit llamaVersion; };
             };
@@ -157,9 +154,9 @@
                 default = config.legacyPackages.llamaPackages.llama-cpp;
                 vulkan = config.packages.default.override { useVulkan = true; };
                 windows = config.legacyPackages.llamaPackagesWindows.llama-cpp;
+                python-scripts = config.legacyPackages.llamaPackages.python-scripts;
               }
-              // lib.optionalAttrs pkgs.stdenv.isLinux {
-                opencl = config.packages.default.override { useOpenCL = true; };
+              // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
                 cuda = config.legacyPackages.llamaPackagesCuda.llama-cpp;
 
                 mpi-cpu = config.packages.default.override { useMpi = true; };
@@ -174,7 +171,7 @@
             #
             # We could test all outputs e.g. as `checks = confg.packages`.
             #
-            # TODO: Build more once https://github.com/ggerganov/llama.cpp/issues/6346 has been addressed
+            # TODO: Build more once https://github.com/ggml-org/llama.cpp/issues/6346 has been addressed
             checks = {
               inherit (config.packages) default vulkan;
             };
